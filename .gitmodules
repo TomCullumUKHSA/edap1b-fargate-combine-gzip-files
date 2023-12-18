@@ -1,0 +1,3 @@
+[submodule "app/modules/loggingutil"]
+	path = app/modules/loggingutil
+	url = ../edap1b-ukhsa-support-loggingutil.git

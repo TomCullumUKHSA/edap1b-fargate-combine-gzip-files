@@ -1,0 +1,19 @@
+trigger:
+  - main
+
+pr:
+  - main
+
+variables:
+  - group: ssh
+  - group: github-cli-pat
+
+resources:
+  repositories:
+  - repository: templates
+    type: git
+    name: ukhsa-edap-devops/BuildTemplates
+
+stages:
+- template: common-container.yml@templates
+
