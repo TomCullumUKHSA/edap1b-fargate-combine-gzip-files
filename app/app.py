@@ -1,26 +1,10 @@
-"""Main module.
-"""
-
-from dataclasses import dataclass
-import datetime as dt
+import gzip
+import shutil
 import logging
 import os
-import pathlib
 import re
-
+from io import BytesIO
 import boto3
-
-
-DEFAULT_S3_KEY_PATTERN = r"^(?:.*/)?([^/]*)$"
-DEFAULT_S3_KEY_REPL = r"\1"
-
-
-@dataclass
-class SubstitutionInfo:
-    """Information needed to generate the target file name from the source key."""
-
-    s3_key_pattern: str = DEFAULT_S3_KEY_PATTERN
-    s3_key_repl: str = DEFAULT_S3_KEY_REPL
 
 
 def path_to_dict(s3_path: str) -> dict:
@@ -34,180 +18,18 @@ def path_to_dict(s3_path: str) -> dict:
     return {"bucket": matches.group(1), "key": matches.group(2)}
 
 
-def s3_key_is_dir(s3_key: str) -> bool:
-    """Returns true if ``s3_key`` is a directory."""
-    return len(s3_key) == 0 or s3_key[-1:] == "/"
-
-
-def s3_key_is_file(s3_key: str) -> bool:
-    """Returns true if ``s3_key`` is a file."""
-    return not s3_key_is_dir(s3_key)
-
-
-def check_if_file_to_file_copy(source_key: str, dest_key: str) -> bool:
-    """check if file to file copy"""
-    file_to_file = False
-
-    if s3_key_is_file(source_key) and s3_key_is_file(dest_key):
-        file_to_file = True
-    elif s3_key_is_dir(source_key) and s3_key_is_file(dest_key):
-        raise RuntimeError("It is not possible to copy a directory to a file.")
-    elif (
-        pathlib.PurePosixPath(source_key).suffix
-        != pathlib.PurePosixPath(dest_key).suffix
-        and pathlib.PurePosixPath(source_key).suffix != ""
-        and pathlib.PurePosixPath(dest_key).suffix != ""
-    ):
-        raise RuntimeError("Source and target files have different formats.")
-
-    return file_to_file
-
-
-def copy_objects(
-    source: str,
-    destination: str,
-    delete_after_copy: bool,
-    max_age: int,
-    s3_key_regex: str,
-    substituttion_info: SubstitutionInfo,
-):
-    """Copy or move S3 objects."""
-    source_dict = path_to_dict(source)
-    destination_dict = path_to_dict(destination)
-    s3_client = boto3.client("s3")
-    first = True
-    cont_token = ""
-    file_to_file = check_if_file_to_file_copy(
-        source_dict["key"], destination_dict["key"]
-    )
-    while first or cont_token:
-        first = False
-        response = (
-            s3_client.list_objects_v2(
-                Bucket=source_dict["bucket"],
-                Prefix=source_dict["key"],
-                ContinuationToken=cont_token,
-            )
-            if cont_token
-            else s3_client.list_objects_v2(
-                Bucket=source_dict["bucket"], Prefix=source_dict["key"]
-            )
-        )
-        cont_token = response.get("NextContinuationToken", "")
-
-        objs = response.get("Contents", None)
-        if not objs:
-            logging.warning("No files found in source.")
-            return
-        for obj in objs:
-            this_source_key = obj.get("Key", "")
-            logging.debug("Processing source key: %s", this_source_key)
-            if not re.fullmatch(s3_key_regex, this_source_key):
-                logging.debug("Skipping key (regex): %s", this_source_key)
-                continue
-            if max_age > 0 and _file_older_than_hours(obj, max_age_hours=max_age):
-                logging.debug("Skipping key (max_age): %s", this_source_key)
-                continue
-
-            logging.info(
-                'Copying file: "%s" to "%s"',
-                f"s3://{source_dict['bucket']}/{this_source_key}",
-                f"s3://{destination_dict['bucket']}/{destination_dict['key']}",
-            )
-            if not file_to_file:
-                _do_copy_one_file_to_dir(
-                    source_dict["bucket"],
-                    this_source_key,
-                    destination_dict["bucket"],
-                    destination_dict["key"],
-                    delete_after_copy,
-                    substituttion_info,
-                )
-            else:
-                _do_copy_one_file_to_file(
-                    source_dict["bucket"],
-                    this_source_key,
-                    destination_dict["bucket"],
-                    destination_dict["key"],
-                    delete_after_copy,
-                )
-
-
-def _file_older_than_hours(s3_object, max_age_hours: float) -> bool:
-    """Return ``True`` if ``s3_object`` is older than ``max_age_hours``."""
-    # last modified date zone-aware datetime
-    last_modified_datetime = s3_object.get("LastModified")
-    if last_modified_datetime is None:
-        logging.warning(
-            "Cannot determine last-modified date of key: %s", s3_object.get("Key")
-        )
-        return True
-
-    now_utc = dt.datetime.now(dt.timezone.utc)
-    age_hours = (now_utc - last_modified_datetime).total_seconds() / 60 / 60
-    if age_hours > max_age_hours:
-        logging.debug(
-            "File is older than %g hours. Max age is %g hours.",
-            age_hours,
-            max_age_hours,
-        )
-        return True
-
-    return False
-
-
-def get_target_filename_from_src_key(
-    src_key: str, substitution_info: SubstitutionInfo
-) -> str:
-    """Obtain the filename from the ``src_key``.
-
-    This function will apply a ``re.sub()`` using the parameters in
-    ``substitution_info``.
-
-    Args:
-        src_key (str): The source S3 key (i.e.: 'ONS/my_table/')
-        substitution_info (SubstitutionInfo): _description_
-
-    Returns:
-        str: _description_
-    """
-    substituted = re.sub(
-        substitution_info.s3_key_pattern, substitution_info.s3_key_repl, src_key
-    )
-    # replace <TIMESTAMP> with an actual timestamp
-    if "<TIMESTAMP>" in substituted:
-        timestamp_str = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        substituted = substituted.replace("<TIMESTAMP>", timestamp_str)
-    logging.info(
-        "Src Key: %s SubstitutionInfo: %r RESULT: %s",
-        src_key,
-        substitution_info,
-        substituted,
-    )
-    return substituted
-
-
-def _do_copy_one_file_to_dir(
+def copy_to_staging(
     src_bucket: str,
     src_key: str,
     dst_bucket: str,
-    dst_dir: str,
-    delete_after_copy: bool,
-    substitution_info: SubstitutionInfo,
 ):
-    # this_source_filename = src_key.rsplit("/", 1)[1] if "/" in src_key else src_key
-    this_source_filename = get_target_filename_from_src_key(src_key, substitution_info)
-    target_key = f"{dst_dir}{this_source_filename}"
-    # apply name transformation on the target key
-
     s3_client = boto3.client("s3")
     s3_client.copy(
         CopySource={"Bucket": src_bucket, "Key": src_key},
         Bucket=dst_bucket,
-        Key=target_key,
     )
-    if delete_after_copy:
-        s3_client.delete_object(Bucket=src_bucket, Key=src_key)
+
+    s3_client.delete_object(Bucket=src_bucket, Key=src_key)
 
 
 def _do_copy_one_file_to_file(
@@ -215,7 +37,6 @@ def _do_copy_one_file_to_file(
     src_key: str,
     dst_bucket: str,
     dst_dir: str,
-    delete_after_copy: bool,
 ):
     s3_client = boto3.client("s3")
     s3_client.copy(
@@ -223,37 +44,97 @@ def _do_copy_one_file_to_file(
         Bucket=dst_bucket,
         Key=dst_dir,
     )
-    if delete_after_copy:
-        s3_client.delete_object(Bucket=src_bucket, Key=src_key)
+
+    s3_client.delete_object(Bucket=src_bucket, Key=src_key)
 
 
-def main(event, _context):
-    """Main function."""
-    # copy or move objects
+def combine_gzip_files_s3(bucket_name, matching_objects, output_file):
+    s3 = boto3.client('s3')
+
+    with open(output_file, 'wb') as outfile:
+        for prefix in sorted(matching_objects):
+            response = s3.get_object(Bucket=bucket_name, Key=prefix)
+            with gzip.GzipFile(fileobj=BytesIO(response['Body'].read())) as infile:
+                shutil.copyfileobj(infile, outfile)
+
+
+def check_if_single_or_multiple_files(source_bucket_name: tuple, source_target_filename_prefix: str) -> list:
+    s3 = boto3.client('s3')
+    objects = s3.list_objects_v2(Bucket=source_bucket_name).get('Contents', [])
+    matching_objects = [obj for obj in objects if obj['Key'].startswith(source_target_filename_prefix)]
+
+    if not matching_objects:
+        print(f"No objects with prefix '{source_target_filename_prefix}' found in the bucket '{source_bucket_name}'.")
+    elif len(matching_objects) == 1 and not matching_objects[0]['Key'].endswith('/'):
+        print(f"The bucket '{source_bucket_name}' contains one file with prefix '{source_target_filename_prefix}'.")
+        return matching_objects
+    else:
+        gzip_files = [obj for obj in matching_objects if obj['Key'].lower().endswith('.gz')]
+
+        if len(gzip_files) > 1:
+            print(f"The bucket '{source_bucket_name}' contains multiple gzip files with a common prefix "
+                  f"'{source_target_filename_prefix}'.")
+            return matching_objects
+        else:
+            print(f"The bucket '{source_bucket_name}' does not meet the specified criteria.")
+
+
+def get_filename_prefix(source_prefix):
+    first_dot_index = source_prefix.find('.')
+    base_filename = source_prefix[:first_dot_index] if first_dot_index != -1 else source_prefix
+    return base_filename
+
+
+def copy_objects(source: str, destination: str):
+    source_dict = path_to_dict(source)
+    destination_dict = path_to_dict(destination)
+
+    source_bucket = source_dict["bucket"]
+    source_prefix = source_dict["key"]
+    dest_bucket = destination_dict["bucket"]
+    dest_prefix = destination_dict["key"]
+
+    filename_prefix = get_filename_prefix(source_prefix)
+
+    matching_objects = check_if_single_or_multiple_files(source_bucket, filename_prefix)
+    if len(matching_objects) > 1:
+        combine_gzip_files_s3(
+            source_dict["bucket"],
+            matching_objects,
+            dest_bucket,
+        )
+        delete_all_gzip_files(source_dict["bucket"])
+    if matching_objects == 1:
+        matching_object = "".join(matching_objects)
+        _do_copy_one_file_to_file(source_bucket, matching_object, dest_bucket, dest_prefix)
+
+
+def delete_all_gzip_files(source: str):
+    """Copy or move S3 objects."""
+    source_dict = path_to_dict(source)
+    s3 = boto3.client('s3')
+
+    objects = s3.list_objects_v2(Bucket=source_dict).get('Contents', [])
+
+    for obj in objects:
+        key = obj['Key']
+        if key.endswith('.gz'):
+            s3.delete_object(Bucket=source_dict, Key=key)
+            print(f"Deleted: s3://{source_dict}/{key}")
+
+
+def main(event):
     copy_objects(
         source=event["source"],
         destination=event["destination"],
-        delete_after_copy=event["move"],
-        max_age=event["max_age"],
-        s3_key_regex=event["s3_key_regex"],
-        substituttion_info=event["substitution_info"],
     )
-
+    
 
 if __name__ == "__main__":
-    # Convert arguments passed through the environment to a dictionary
     logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
     main(
         {
             "source": os.getenv("SOURCE", ""),
             "destination": os.getenv("DESTINATION", ""),
-            "move": os.getenv("MOVE", "FALSE").upper() in ("TRUE", "Y", "YES", "1"),
-            "max_age": int(os.getenv("MAX_AGE") or "0"),
-            "s3_key_regex": os.getenv("S3_KEY_REGEX") or r"^.*$",
-            "substitution_info": SubstitutionInfo(
-                s3_key_pattern=os.getenv("S3_KEY_PATTERN") or DEFAULT_S3_KEY_PATTERN,
-                s3_key_repl=os.getenv("S3_KEY_REPL") or r"\1",
-            ),
-        },
-        None,
+        }
     )
